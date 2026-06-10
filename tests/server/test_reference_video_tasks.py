@@ -83,6 +83,21 @@ def _write_project(tmp_path: Path) -> Path:
     return proj_dir
 
 
+def _wire_locked_script(fake_pm: MagicMock) -> None:
+    """让 fake_pm.locked_script 产出磁盘上的真实剧本 dict。
+
+    finalize 写回 unit 资产时会在剧本中查找 unit 并在缺失时抛 KeyError，
+    裸 MagicMock 的 script.get("video_units") 不是 list 会直接炸。
+    """
+    proj_dir = fake_pm.get_project_path.return_value
+
+    @contextmanager
+    def _locked(_name, script_file, *, validate=True):
+        yield json.loads((proj_dir / script_file).read_text(encoding="utf-8"))
+
+    fake_pm.locked_script.side_effect = _locked
+
+
 def test_resolve_unit_references_maps_sheets(tmp_path: Path):
     proj_dir = _write_project(tmp_path)
     project, unit = _load_project_and_unit(proj_dir, "E1U1")
@@ -271,6 +286,7 @@ async def test_execute_reference_video_task_success(tmp_path: Path, monkeypatch:
         return json.loads((proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8"))
 
     fake_pm.load_script.side_effect = fake_load_script
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     # Mock generator.generate_video_async: 创建伪视频文件
@@ -404,6 +420,7 @@ async def test_execute_reference_video_task_grok_uses_provider_default_resolutio
     fake_pm.load_script.side_effect = lambda *_a: json.loads(
         (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
     )
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     captured: dict = {}
@@ -467,6 +484,7 @@ async def test_execute_reference_video_task_respects_project_model_settings_reso
     fake_pm.load_script.side_effect = lambda *_a: json.loads(
         (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
     )
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     captured: dict = {}
@@ -519,6 +537,7 @@ async def test_execute_reference_video_task_missing_reference_fails(tmp_path: Pa
     fake_pm.load_script.side_effect = lambda *_a: json.loads(
         (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
     )
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     with pytest.raises(MissingReferenceError):
@@ -550,6 +569,7 @@ async def test_execute_reference_video_task_uses_real_media_generator(tmp_path: 
     fake_pm.load_script.side_effect = lambda *_a: json.loads(
         (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
     )
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     # 只 mock 最外层：VideoBackend（唯一的真外部依赖）+ UsageTracker/ConfigResolver
@@ -647,6 +667,7 @@ async def test_execute_reference_video_task_payload_too_large_retries(tmp_path: 
     fake_pm.load_script.side_effect = lambda *_a: json.loads(
         (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
     )
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     call_count = {"n": 0}
@@ -715,6 +736,7 @@ async def test_execute_reference_video_task_clamps_via_resolver(
     fake_pm.load_project.return_value = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
     fake_pm.get_project_path.return_value = proj_dir
     fake_pm.load_script.side_effect = lambda *_a: json.loads(script_path.read_text(encoding="utf-8"))
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     captured: dict = {}
@@ -816,6 +838,7 @@ async def test_execute_reference_video_task_prompt_matches_clipped_refs(
     fake_pm.load_project.return_value = json.loads(project_path.read_text(encoding="utf-8"))
     fake_pm.get_project_path.return_value = proj_dir
     fake_pm.load_script.side_effect = lambda *_a: json.loads(script_path.read_text(encoding="utf-8"))
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     captured: dict = {}
@@ -914,6 +937,7 @@ async def test_gemini_model_settings_read_via_composite_key(
     fake_pm.load_script.side_effect = lambda *_a: json.loads(
         (proj_dir / "scripts" / "episode_1.json").read_text(encoding="utf-8")
     )
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     captured: dict = {}
@@ -979,6 +1003,7 @@ async def test_execute_reference_video_task_skips_clamp_when_backend_model_diver
     fake_pm.load_project.return_value = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
     fake_pm.get_project_path.return_value = proj_dir
     fake_pm.load_script.side_effect = lambda *_a: json.loads(script_path.read_text(encoding="utf-8"))
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     captured: dict = {}
@@ -1064,6 +1089,7 @@ async def test_execute_reference_video_task_rejects_unsupported_duration(
     fake_pm.load_project.return_value = json.loads((proj_dir / "project.json").read_text(encoding="utf-8"))
     fake_pm.get_project_path.return_value = proj_dir
     fake_pm.load_script.side_effect = lambda *_a: json.loads(script_path.read_text(encoding="utf-8"))
+    _wire_locked_script(fake_pm)
     monkeypatch.setattr(rvt, "get_project_manager", lambda: fake_pm)
 
     async def _fake_generate_video_async(**kwargs):
@@ -1110,3 +1136,31 @@ async def test_execute_reference_video_task_rejects_unsupported_duration(
         )
     # 守卫在调用 backend 前拦下：generate_video_async 不应被调用
     fake_generator.generate_video_async.assert_not_called()
+
+
+def test_apply_unit_video_assets_distinguishes_failures():
+    """结构损坏与 unit 不存在抛不同异常：还原侧据此区分「脏脚本告警」与「正常跳过」。"""
+    from lib.script_editor import ScriptEditError
+    from server.services.reference_video_tasks import apply_unit_video_assets
+
+    with pytest.raises(ScriptEditError):
+        apply_unit_video_assets({"video_units": "broken"}, "E1U1", video_uri=None, thumb_rel=None)
+    with pytest.raises(ScriptEditError):
+        apply_unit_video_assets({}, "E1U1", video_uri=None, thumb_rel=None)
+    with pytest.raises(ScriptEditError):
+        apply_unit_video_assets(
+            {"video_units": [{"unit_id": "E1U1", "generated_assets": "broken"}]},
+            "E1U1",
+            video_uri=None,
+            thumb_rel=None,
+        )
+    with pytest.raises(KeyError):
+        apply_unit_video_assets({"video_units": []}, "E1U1", video_uri=None, thumb_rel=None)
+
+    script = {"video_units": [{"unit_id": "E1U1", "generated_assets": {"video_uri": "https://old"}}]}
+    apply_unit_video_assets(script, "E1U1", video_uri=None, thumb_rel="reference_videos/thumbnails/E1U1.jpg")
+    ga = script["video_units"][0]["generated_assets"]
+    assert ga["video_clip"] == "reference_videos/E1U1.mp4"
+    assert "video_uri" not in ga
+    assert ga["video_thumbnail"] == "reference_videos/thumbnails/E1U1.jpg"
+    assert ga["status"] == "completed"
