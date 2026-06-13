@@ -141,27 +141,109 @@ def is_retryable_http_status(status_code: int, *, retry_not_found: bool = False)
     return False
 
 
-def _retry_http_error(exc: Exception, *, retry_not_found: bool) -> bool:
-    """中转视频后端统一重试谓词。
+# httpx 传输错误中「请求确定未送达」的子集：连接建立阶段失败 / 从未取得连接 / 代理握手失败。
+# 重试安全——服务端不可能已建任务 / 已计费。读/写阶段及之后的传输错误（ReadTimeout、
+# WriteError、连接中途断开、RemoteProtocolError 等）请求可能已抵达服务端，归歧义态，不在此列。
+_NOT_SENT_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,  # 代理连接/握手失败：请求从未离开客户端→代理段，未抵达目标供应商
+)
 
-    HTTPStatusError 按 status_code 显式闸门判定，绕开 `_should_retry` 对异常字符串的子串
-    兜底——HTTPStatusError 消息含 URL/task_id，其中的 "500"/"503" 子串会被误判为可重试。
-    网络/传输错误（RequestError）与基础瞬态错误（Connection/Timeout）重试；其余（含
-    ResumeExpiredError 等业务异常）一律快速失败。
+# 请求字节发出前就确定失败的本地/协议错误：URL scheme 不受支持（UnsupportedProtocol）
+# 或本地请求构造违反协议（LocalProtocolError）。二者既无重复计费风险，重试到 max_wait
+# 也不会变好——poll 路径快速失败、submit 路径原样抛出（非歧义态，不套「请求可能已送达」）。
+# 注意 RemoteProtocolError 是其同级 ProtocolError 子类，但属「服务端中途断开」，不在此列。
+_NON_RETRYABLE_LOCAL_ERRORS: tuple[type[Exception], ...] = (
+    httpx.LocalProtocolError,
+    httpx.UnsupportedProtocol,
+)
+
+
+class AmbiguousSubmitError(RuntimeError):
+    """create/submit（非幂等的「创建 + 计费」）阶段的歧义态失败。
+
+    请求可能已抵达服务端并已落库 + 已计费，但响应在途丢失（ReadTimeout、写超时、
+    连接中途断开、RemoteProtocolError 等）。此时自动重试会重复建任务 + 重复计费，故
+    不重试、直接终态失败；error_message 带 ``[create_ambiguous]`` 前缀提示运维到供应商侧
+    确认任务状态后再手动重试（与 ``[restart_lost]`` / ``[resume_unsupported]``
+    「宁可手动重试、不可重复计费」先例一致，agent-facing 豁免 i18n）。
     """
-    if isinstance(exc, httpx.HTTPStatusError):
-        return is_retryable_http_status(exc.response.status_code, retry_not_found=retry_not_found)
-    return isinstance(exc, (httpx.RequestError, *BASE_RETRYABLE_ERRORS))
+
+    def __init__(self, *, provider: str, message: str = "") -> None:
+        self.provider = provider
+        super().__init__(
+            message
+            or f"[create_ambiguous] {provider} 创建请求可能已送达服务端但响应在途丢失"
+            "（读超时/连接中途断开），为避免重复建任务与重复计费不自动重试；"
+            "请到供应商侧确认任务状态后再手动重试"
+        )
 
 
 def should_retry_submit(exc: Exception) -> bool:
-    """创建/提交阶段（POST）重试谓词：404 视为确定性端点错误，快速失败。"""
-    return _retry_http_error(exc, retry_not_found=False)
+    """创建/提交阶段（非幂等「创建 + 计费」POST）重试谓词。
+
+    与 ``should_retry_poll`` 的关键区别：传输错误只重试「请求确定未送达」的子集
+    （``_NOT_SENT_TRANSPORT_ERRORS``：连接建立失败 / 从未取得连接 / 代理握手失败），重试不会重复建
+    任务、不会重复计费。歧义态（ReadTimeout 等「请求可能已被服务端处理」）由
+    ``submit_post`` 包成 ``AmbiguousSubmitError`` 终态失败，本谓词对其（及一切业务异常）
+    返回 False。HTTPStatusError 按 status_code 显式闸门：5xx/408/425/429 重试（服务端
+    明示创建失败），404 与确定性 4xx 快速失败。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return is_retryable_http_status(exc.response.status_code, retry_not_found=False)
+    return isinstance(exc, _NOT_SENT_TRANSPORT_ERRORS)
 
 
 def should_retry_poll(exc: Exception) -> bool:
-    """轮询/下载阶段（GET）重试谓词：404 视为"短暂未就绪"，重试。"""
-    return _retry_http_error(exc, retry_not_found=True)
+    """轮询/下载阶段（幂等 GET）重试谓词。
+
+    幂等查询重试无副作用，故传输/网络错误（RequestError）与基础瞬态错误一律重试；唯本地/
+    协议错误（``_NON_RETRYABLE_LOCAL_ERRORS``：UnsupportedProtocol / LocalProtocolError）在
+    请求发出前就确定失败，重试到 max_wait 也不会变好，快速失败。HTTPStatusError 按
+    status_code 闸门，404 视为"任务提交后短暂未就绪 / 资源未传播"重试。HTTPStatusError 消息
+    含 URL/task_id，其中 "500"/"503" 子串会被字符串兜底误判，故走显式 status_code 判定绕开；
+    ResumeExpiredError 等业务异常一律快速失败。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return is_retryable_http_status(exc.response.status_code, retry_not_found=True)
+    if isinstance(exc, _NON_RETRYABLE_LOCAL_ERRORS):
+        return False
+    return isinstance(exc, (httpx.RequestError, *BASE_RETRYABLE_ERRORS))
+
+
+async def submit_post(
+    post_fn: Callable[[], Awaitable[httpx.Response]],
+    *,
+    provider: str,
+) -> httpx.Response:
+    """create/提交阶段（非幂等 POST）统一包装：按「请求是否确定送达」给失败分流。
+
+    - 连接/代理建立失败（ConnectError/ConnectTimeout/PoolTimeout/ProxyError）：请求确定未送达
+      → 原样抛出，交 ``should_retry_submit`` 重试。
+    - 本地/协议错误（UnsupportedProtocol/LocalProtocolError）：请求发出前就确定失败、无计费
+      风险 → 原样抛出，由 ``should_retry_submit`` 快速失败（非歧义态，不套「请求可能已送达」）。
+    - 其余传输错误（ReadTimeout/WriteError/RemoteProtocolError 等）：请求可能已被服务端
+      处理 → 抛 ``AmbiguousSubmitError`` 终态失败，不重试，避免重复建任务 + 重复计费。
+    - 收到 >=400 响应：先落 body 日志（诊断 413 等），再 ``raise_for_status`` 抛
+      HTTPStatusError，交 ``should_retry_submit`` 按 status_code 分流。
+
+    与 ``with_retry_async(retry_if=should_retry_submit)`` 配套使用：装饰器负责重试，
+    本包装负责把歧义态在重试前转成不可重试的终态异常。
+    """
+    try:
+        resp = await post_fn()
+    except httpx.RequestError as exc:
+        # 请求确定未送达——连接建立失败（瞬态、可重试）或本地/协议错误（确定性、快速失败）——
+        # 均无重复建任务 / 重复计费风险，原样抛出交 should_retry_submit 分流；不套歧义态。
+        if isinstance(exc, (*_NOT_SENT_TRANSPORT_ERRORS, *_NON_RETRYABLE_LOCAL_ERRORS)):
+            raise
+        raise AmbiguousSubmitError(provider=provider) from exc
+    if resp.status_code >= 400:
+        logger.warning("%s create 返回 %s: %s", provider, resp.status_code, resp.text[:500])
+        resp.raise_for_status()
+    return resp
 
 
 async def poll_with_retry[T](
